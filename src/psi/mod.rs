@@ -682,6 +682,7 @@ mod test {
     use crate::packet::Packet;
     use hex_literal::*;
     use std::cell::RefCell;
+    use std::marker::PhantomData;
     use std::rc::Rc;
 
     /// `WholeSectionSyntaxPayloadParser` mock that discards sections, used as a no-op sink for
@@ -756,13 +757,7 @@ mod test {
     fn build_packet(pusi: bool, pid: u16, prefix: &[u8]) -> [u8; 188] {
         assert!(prefix.len() <= 184);
         let mut buf = [0xffu8; 188];
-        buf[0] = 0x47;
-        buf[1] = ((pid >> 8) & 0x1f) as u8;
-        if pusi {
-            buf[1] |= 0b0100_0000;
-        }
-        buf[2] = (pid & 0xff) as u8;
-        buf[3] = 0b0001_0000; // adaptation_field_control = payload only, CC = 0
+        write_ts_header(&mut buf, pusi, pid, 0, false);
         buf[4..4 + prefix.len()].copy_from_slice(prefix);
         buf
     }
@@ -773,15 +768,22 @@ mod test {
     fn build_full_packet(pusi: bool, pid: u16, payload: &[u8]) -> [u8; 188] {
         assert_eq!(payload.len(), 184);
         let mut buf = [0u8; 188];
+        write_ts_header(&mut buf, pusi, pid, 0, false);
+        buf[4..188].copy_from_slice(payload);
+        buf
+    }
+
+    fn write_ts_header(buf: &mut [u8; 188], pusi: bool, pid: u16, cc: u8, has_af: bool) {
+        assert!(pid <= 0x1fff);
+        assert!(cc <= 0x0f);
         buf[0] = 0x47;
         buf[1] = ((pid >> 8) & 0x1f) as u8;
         if pusi {
             buf[1] |= 0b0100_0000;
         }
         buf[2] = (pid & 0xff) as u8;
-        buf[3] = 0b0001_0000;
-        buf[4..188].copy_from_slice(payload);
-        buf
+        let adaptation_field_control = if has_af { 0b0011_0000 } else { 0b0001_0000 };
+        buf[3] = adaptation_field_control | cc;
     }
 
     /// Build a minimal valid section-syntax section with `body_len` bytes of payload after the
@@ -814,12 +816,24 @@ mod test {
         out
     }
 
-    /// `WholeSectionSyntaxPayloadParser` mock that records each delivered section's data.
-    struct SyntaxSink {
+    /// Section payload parser mock that records each delivered section's data.
+    struct RecordingSectionSink<C> {
         sections: Rc<RefCell<Vec<Vec<u8>>>>,
+        _context: PhantomData<fn(C)>,
     }
-    impl WholeSectionSyntaxPayloadParser for SyntaxSink {
-        type Context = ();
+
+    impl<C> RecordingSectionSink<C> {
+        fn new(sections: Rc<RefCell<Vec<Vec<u8>>>>) -> Self {
+            Self {
+                sections,
+                _context: PhantomData,
+            }
+        }
+    }
+
+    impl<C: ErrorSink> WholeSectionSyntaxPayloadParser for RecordingSectionSink<C> {
+        type Context = C;
+
         fn section<'a>(
             &mut self,
             _ctx: &mut Self::Context,
@@ -831,12 +845,9 @@ mod test {
         }
     }
 
-    /// `WholeCompactSyntaxPayloadParser` mock that records each delivered section's data.
-    struct CompactSink {
-        sections: Rc<RefCell<Vec<Vec<u8>>>>,
-    }
-    impl WholeCompactSyntaxPayloadParser for CompactSink {
-        type Context = ();
+    impl<C: ErrorSink> WholeCompactSyntaxPayloadParser for RecordingSectionSink<C> {
+        type Context = C;
+
         fn section(
             &mut self,
             _ctx: &mut Self::Context,
@@ -848,25 +859,27 @@ mod test {
     }
 
     #[allow(clippy::type_complexity)]
-    fn syntax_framer() -> (SectionSyntaxFramer<SyntaxSink>, Rc<RefCell<Vec<Vec<u8>>>>) {
+    fn syntax_framer() -> (
+        SectionSyntaxFramer<RecordingSectionSink<()>>,
+        Rc<RefCell<Vec<Vec<u8>>>>,
+    ) {
         let sink_out = Rc::new(RefCell::new(vec![]));
         let framer = SectionSyntaxFramer::new(
             packet::Pid::new(0),
-            SyntaxSink {
-                sections: sink_out.clone(),
-            },
+            RecordingSectionSink::new(sink_out.clone()),
         );
         (framer, sink_out)
     }
 
     #[allow(clippy::type_complexity)]
-    fn compact_framer() -> (CompactSyntaxFramer<CompactSink>, Rc<RefCell<Vec<Vec<u8>>>>) {
+    fn compact_framer() -> (
+        CompactSyntaxFramer<RecordingSectionSink<()>>,
+        Rc<RefCell<Vec<Vec<u8>>>>,
+    ) {
         let sink_out = Rc::new(RefCell::new(vec![]));
         let framer = CompactSyntaxFramer::new(
             packet::Pid::new(0),
-            CompactSink {
-                sections: sink_out.clone(),
-            },
+            RecordingSectionSink::new(sink_out.clone()),
         );
         (framer, sink_out)
     }
