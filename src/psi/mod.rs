@@ -754,10 +754,10 @@ mod test {
     /// [`build_full_packet`] which requires the payload to fill all 184 bytes, since the
     /// framer cannot distinguish between mid-section data bytes that happen to be 0xff and
     /// stuffing.
-    fn build_packet(pusi: bool, pid: u16, prefix: &[u8]) -> [u8; 188] {
+    fn build_packet(pusi: bool, pid: u16, cc: u8, prefix: &[u8]) -> [u8; 188] {
         assert!(prefix.len() <= 184);
         let mut buf = [0xffu8; 188];
-        write_ts_header(&mut buf, pusi, pid, 0, false);
+        write_ts_header(&mut buf, pusi, pid, cc, false);
         buf[4..4 + prefix.len()].copy_from_slice(prefix);
         buf
     }
@@ -765,10 +765,10 @@ mod test {
     /// Build a 188-byte TS packet whose payload is exactly the 184 supplied bytes - no
     /// trailing stuffing.  Use this for packets that carry mid-section continuation data,
     /// where every byte of the payload is part of the in-progress section.
-    fn build_full_packet(pusi: bool, pid: u16, payload: &[u8]) -> [u8; 188] {
+    fn build_full_packet(pusi: bool, pid: u16, cc: u8, payload: &[u8]) -> [u8; 188] {
         assert_eq!(payload.len(), 184);
         let mut buf = [0u8; 188];
-        write_ts_header(&mut buf, pusi, pid, 0, false);
+        write_ts_header(&mut buf, pusi, pid, cc, false);
         buf[4..188].copy_from_slice(payload);
         buf
     }
@@ -894,10 +894,10 @@ mod test {
         let section = make_syntax_section(0x42, 300);
         let mut first = vec![0u8]; // pointer_field = 0
         first.extend_from_slice(&section[..183]);
-        let pkt1 = build_full_packet(true, 0, &first);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
         framer.consume(&mut (), &Packet::new(&pkt1));
         assert_eq!(sink.borrow().len(), 0); // not yet complete
-        let pkt2 = build_packet(false, 0, &section[183..]);
+        let pkt2 = build_packet(false, 0, 1, &section[183..]);
         framer.consume(&mut (), &Packet::new(&pkt2));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
@@ -909,7 +909,7 @@ mod test {
         let section = make_syntax_section(0x42, 16);
         let mut payload = vec![0u8];
         payload.extend_from_slice(&section);
-        let pkt = build_packet(true, 0, &payload);
+        let pkt = build_packet(true, 0, 0, &payload);
         framer.consume(&mut (), &Packet::new(&pkt));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
@@ -923,15 +923,18 @@ mod test {
         let section = make_syntax_section(0x42, 500);
         let mut first = vec![0u8];
         first.extend_from_slice(&section[..183]);
-        framer.consume(&mut (), &Packet::new(&build_full_packet(true, 0, &first)));
         framer.consume(
             &mut (),
-            &Packet::new(&build_full_packet(false, 0, &section[183..183 + 184])),
+            &Packet::new(&build_full_packet(true, 0, 0, &first)),
+        );
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_full_packet(false, 0, 1, &section[183..183 + 184])),
         );
         assert_eq!(sink.borrow().len(), 0);
         framer.consume(
             &mut (),
-            &Packet::new(&build_packet(false, 0, &section[183 + 184..])),
+            &Packet::new(&build_packet(false, 0, 2, &section[183 + 184..])),
         );
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
@@ -952,9 +955,15 @@ mod test {
         let mut first = vec![0u8];
         first.extend_from_slice(&sec_a);
         first.extend_from_slice(&sec_b[..1]);
-        framer.consume(&mut (), &Packet::new(&build_full_packet(true, 0, &first)));
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_full_packet(true, 0, 0, &first)),
+        );
         assert_eq!(sink.borrow().len(), 1);
-        framer.consume(&mut (), &Packet::new(&build_packet(false, 0, &sec_b[1..])));
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_packet(false, 0, 1, &sec_b[1..])),
+        );
         assert_eq!(sink.borrow().len(), 2);
         assert_eq!(&sink.borrow()[0], &sec_a);
         assert_eq!(&sink.borrow()[1], &sec_b);
@@ -971,9 +980,15 @@ mod test {
         let mut first = vec![0u8];
         first.extend_from_slice(&sec_a);
         first.extend_from_slice(&sec_b[..3]);
-        framer.consume(&mut (), &Packet::new(&build_full_packet(true, 0, &first)));
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_full_packet(true, 0, 0, &first)),
+        );
         assert_eq!(sink.borrow().len(), 1);
-        framer.consume(&mut (), &Packet::new(&build_packet(false, 0, &sec_b[3..])));
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_packet(false, 0, 1, &sec_b[3..])),
+        );
         assert_eq!(sink.borrow().len(), 2);
         assert_eq!(&sink.borrow()[0], &sec_a);
         assert_eq!(&sink.borrow()[1], &sec_b);
@@ -988,7 +1003,7 @@ mod test {
         let mut payload = vec![0u8];
         payload.extend_from_slice(&sec_a);
         payload.extend_from_slice(&sec_b);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 2);
         assert_eq!(&sink.borrow()[0], &sec_a);
         assert_eq!(&sink.borrow()[1], &sec_b);
@@ -1005,11 +1020,11 @@ mod test {
         first.extend_from_slice(&sec_a);
         let space_left = 184 - first.len();
         first.extend_from_slice(&sec_b[..space_left]);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &first)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &first)));
         assert_eq!(sink.borrow().len(), 1);
         framer.consume(
             &mut (),
-            &Packet::new(&build_packet(false, 0, &sec_b[space_left..])),
+            &Packet::new(&build_packet(false, 0, 1, &sec_b[space_left..])),
         );
         assert_eq!(sink.borrow().len(), 2);
         assert_eq!(&sink.borrow()[0], &sec_a);
@@ -1024,7 +1039,7 @@ mod test {
         let mut payload = vec![0u8];
         payload.extend_from_slice(&section);
         payload.extend_from_slice(&[0xff; 4]);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
     }
@@ -1034,7 +1049,7 @@ mod test {
         // pointer_field=0 but the first byte is 0xff - no sections delivered, no warnings.
         let (mut framer, sink) = syntax_framer();
         let payload = vec![0u8, 0xff, 0xff, 0xff, 0xff];
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 0);
     }
 
@@ -1051,7 +1066,7 @@ mod test {
         let mut payload = vec![pre_pointer.len() as u8];
         payload.extend_from_slice(&pre_pointer);
         payload.extend_from_slice(&sec_b);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         // first valid section was delivered, no warnings expected
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &sec_b);
@@ -1063,13 +1078,13 @@ mod test {
         // we have no idea what section it belongs to, so it must be silently discarded.
         let (mut framer, sink) = syntax_framer();
         let payload = vec![0x12u8; 100]; // arbitrary garbage
-        framer.consume(&mut (), &Packet::new(&build_packet(false, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(false, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 0);
         // and a subsequent valid PUSI=1 packet is now processed normally,
         let section = make_syntax_section(0x42, 16);
         let mut full = vec![0u8];
         full.extend_from_slice(&section);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &full)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &full)));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
     }
@@ -1082,13 +1097,16 @@ mod test {
         let sec_a = make_syntax_section(0x42, 300);
         let mut first = vec![0u8];
         first.extend_from_slice(&sec_a[..183]);
-        framer.consume(&mut (), &Packet::new(&build_full_packet(true, 0, &first)));
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_full_packet(true, 0, 0, &first)),
+        );
         let tail_len = sec_a.len() - 183;
         let sec_b = make_syntax_section(0x43, 10);
         let mut second = vec![tail_len as u8];
         second.extend_from_slice(&sec_a[183..]);
         second.extend_from_slice(&sec_b);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &second)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 1, &second)));
         assert_eq!(sink.borrow().len(), 2);
         assert_eq!(&sink.borrow()[0], &sec_a);
         assert_eq!(&sink.borrow()[1], &sec_b);
@@ -1102,7 +1120,7 @@ mod test {
         section[1] &= 0b0111_1111; // clear section_syntax_indicator
         let mut payload = vec![0u8];
         payload.extend_from_slice(&section);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 0);
     }
 
@@ -1111,7 +1129,7 @@ mod test {
         // Synthetic header claiming section_length=4094 (one over the spec limit).
         let (mut framer, sink) = syntax_framer();
         let payload = vec![0u8, 0x42, 0x8f, 0xfe];
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 0);
     }
 
@@ -1121,7 +1139,7 @@ mod test {
         let section = make_compact_section(0x72, 16);
         let mut payload = vec![0u8];
         payload.extend_from_slice(&section);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
     }
@@ -1132,10 +1150,13 @@ mod test {
         let section = make_compact_section(0x72, 300);
         let mut first = vec![0u8];
         first.extend_from_slice(&section[..183]);
-        framer.consume(&mut (), &Packet::new(&build_full_packet(true, 0, &first)));
         framer.consume(
             &mut (),
-            &Packet::new(&build_packet(false, 0, &section[183..])),
+            &Packet::new(&build_full_packet(true, 0, 0, &first)),
+        );
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_packet(false, 0, 1, &section[183..])),
         );
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
@@ -1175,7 +1196,7 @@ mod test {
         // once the zero-length section has been delivered.
         let mut payload = [0xffu8; 184];
         payload[0] = 0x00;
-        let pkt2 = build_full_packet(false, 0, &payload);
+        let pkt2 = build_full_packet(false, 0, 1, &payload);
         framer.consume(&mut (), &Packet::new(&pkt2));
 
         // Exactly one zero-length compact section should have been delivered.
@@ -1197,7 +1218,7 @@ mod test {
         let section_a = make_compact_section(0x70, 8);
         let mut payload1 = vec![0u8];
         payload1.extend_from_slice(&section_a);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload1)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload1)));
         assert_eq!(sink.borrow().len(), 1);
 
         // Packet 2: PUSI=1 with pointer_field=3.  The 3 pre-pointer bytes
@@ -1209,7 +1230,7 @@ mod test {
         let section_b = make_compact_section(0x71, 4);
         let mut payload2 = vec![3u8, 0x7e, 0x00, 0x00];
         payload2.extend_from_slice(&section_b);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload2)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload2)));
 
         // Only the two real sections must be delivered - no bogus 0x7e section.
         assert_eq!(sink.borrow().len(), 2);
@@ -1309,19 +1330,19 @@ mod test {
         let (mut framer, sink) = compact_framer();
         let mut payload = vec![0u8];
         payload.extend_from_slice(&hex!("42f131")); // section_syntax_indicator = 1
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 0);
 
         // section_length of 4094 exceeds the generic 4093 limit - reject,
         let (mut framer, sink) = compact_framer();
         let payload = vec![0u8, 0x42, 0x0f, 0xfe];
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 0);
 
         // A valid compact section with section_length=0 should be delivered,
         let (mut framer, sink) = compact_framer();
         let payload = vec![0u8, 0x42, 0x70, 0x00];
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
         assert_eq!(sink.borrow().len(), 1);
     }
 
@@ -1336,7 +1357,10 @@ mod test {
         // partial delivery - section is incomplete after this packet,
         let mut partial = vec![0u8];
         partial.extend_from_slice(&big[..183]);
-        framer.consume(&mut (), &Packet::new(&build_full_packet(true, 0, &partial)));
+        framer.consume(
+            &mut (),
+            &Packet::new(&build_full_packet(true, 0, 0, &partial)),
+        );
         assert_eq!(sink.borrow().len(), 0);
         framer.reset();
         assert_eq!(sink.borrow().len(), 0);
@@ -1346,7 +1370,7 @@ mod test {
         let small = make_compact_section(0x71, 4);
         let mut full = vec![0u8];
         full.extend_from_slice(&small);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &full)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &full)));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &small);
     }
@@ -1360,7 +1384,7 @@ mod test {
             section[1] &= 0b0111_1111; // clear section_syntax_indicator
             let mut payload = vec![0u8];
             payload.extend_from_slice(&section);
-            framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+            framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
             assert_eq!(sink.borrow().len(), 0);
         }
 
@@ -1370,7 +1394,7 @@ mod test {
             let (mut framer, sink) = syntax_framer();
             // table_id=0x42, section_syntax_indicator=1, section_length=4 (< 5)
             let payload = vec![0u8, 0x42, 0x80, 0x04];
-            framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+            framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
             assert_eq!(sink.borrow().len(), 0);
         }
 
@@ -1378,7 +1402,7 @@ mod test {
         {
             let (mut framer, sink) = syntax_framer();
             let payload = vec![0u8, 0x42, 0x8f, 0xfe];
-            framer.consume(&mut (), &Packet::new(&build_packet(true, 0, &payload)));
+            framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload)));
             assert_eq!(sink.borrow().len(), 0);
         }
     }
