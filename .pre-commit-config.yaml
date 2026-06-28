@@ -1,0 +1,14 @@
+repos:
+  - repo: https://github.com/AndrejOrsula/pre-commit-cargo
+    rev: 0.4.0
+    hooks:
+      - id: cargo-fmt
+  - repo: local
+    hooks:
+      - id: megalinter-incremental
+        name: Run MegaLinter (skipping linters that run in project mode)
+        entry: env MEGALINTER_PRE_COMMIT=1 ./scripts/mega-linter.sh
+        language: system
+        require_serial: true
+        stages:
+          - pre-commit
