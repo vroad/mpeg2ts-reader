@@ -218,6 +218,9 @@ impl<'buf> AdaptationField<'buf> {
     fn pcr_flag(&self) -> bool {
         self.buf[0] & 0b1_0000 != 0
     }
+    fn has_pcr(&self) -> bool {
+        self.pcr_flag() && self.buf.len() >= 1 + Self::PCR_SIZE
+    }
     fn opcr_flag(&self) -> bool {
         self.buf[0] & 0b1000 != 0
     }
@@ -707,6 +710,39 @@ impl<'buf> Packet<'buf> {
         self.buf
     }
 
+    /// Returns true when `other` is a duplicate copy of this packet.
+    ///
+    /// Null packets and packets without payload are never treated as duplicates. Duplicate packets
+    /// have identical TS packet bytes, except that PCR bytes are ignored because they may differ
+    /// between repeated packets.
+    pub fn is_duplicate_of(&self, other: &Packet<'_>) -> bool {
+        const NON_PCR_COMPARE_OFFSET: usize = 6;
+        const PCR_COMPARE_OFFSET: usize = ADAPTATION_FIELD_OFFSET + 1 + AdaptationField::PCR_SIZE;
+
+        if !self.adaptation_control().has_payload() || u16::from(self.pid()) == Pid::MAX_VALUE {
+            return false;
+        }
+
+        if self.buf[..NON_PCR_COMPARE_OFFSET] != other.buf[..NON_PCR_COMPARE_OFFSET] {
+            return false;
+        }
+
+        let offset = if self.has_pcr() {
+            PCR_COMPARE_OFFSET
+        } else {
+            NON_PCR_COMPARE_OFFSET
+        };
+
+        self.buf[offset..] == other.buf[offset..]
+    }
+
+    fn has_pcr(&self) -> bool {
+        match self.adaptation_field() {
+            Ok(Some(af)) => af.has_pcr(),
+            _ => false,
+        }
+    }
+
     #[inline]
     fn content_offset(&self) -> usize {
         if self.adaptation_control().has_adaptation_field() {
@@ -804,6 +840,98 @@ mod test {
     #[test]
     fn empty_adaptation_field_extension() {
         assert!(AdaptationFieldExtension::new(b"").is_err());
+    }
+
+    #[test]
+    fn duplicate_packet() {
+        let mut buf = [0xffu8; Packet::SIZE];
+        buf[0] = Packet::SYNC_BYTE;
+        buf[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        buf[2] = 0; // PID low bits = 0
+        buf[3] = 0b0001_0011; // payload only, CC=3
+        buf[4] = 0; // pointer_field
+        buf[5] = 0x42; // table_id
+
+        assert!(Packet::new(&buf).is_duplicate_of(&Packet::new(&buf)));
+    }
+
+    #[test]
+    fn duplicate_packet_ignores_pcr() {
+        let mut first = [0xffu8; Packet::SIZE];
+        first[0] = Packet::SYNC_BYTE;
+        first[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        first[2] = 0; // PID low bits = 0
+        first[3] = 0b0011_0011; // adaptation field + payload, CC=3
+        first[4] = 7; // adaptation_field_length: flags + 6 PCR bytes
+        first[5] = 0b0001_0000; // PCR flag
+        first[12] = 0; // pointer_field
+        first[13] = 0x42; // table_id
+
+        let mut second = first;
+        second[6..12].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        assert!(Packet::new(&first).is_duplicate_of(&Packet::new(&second)));
+    }
+
+    #[test]
+    fn non_pcr_adaptation_field_difference_is_not_duplicate() {
+        let mut first = [0xffu8; Packet::SIZE];
+        first[0] = Packet::SYNC_BYTE;
+        first[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        first[2] = 0; // PID low bits = 0
+        first[3] = 0b0011_0011; // adaptation field + payload, CC=3
+        first[4] = 8; // adaptation_field_length: flags + 6 PCR bytes + 1 private byte
+        first[5] = 0b0001_0000; // PCR flag
+        first[12] = 0xaa; // private adaptation field byte
+        first[13] = 0; // pointer_field
+        first[14] = 0x42; // table_id
+
+        let mut second = first;
+        second[12] = 0xbb;
+
+        assert!(!Packet::new(&first).is_duplicate_of(&Packet::new(&second)));
+    }
+
+    #[test]
+    fn duplicate_packet_detects_payload_difference() {
+        let mut first = [0xffu8; Packet::SIZE];
+        first[0] = Packet::SYNC_BYTE;
+        first[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        first[2] = 0; // PID low bits = 0
+        first[3] = 0b0011_0011; // adaptation field + payload, CC=3
+        first[4] = 7; // adaptation_field_length: flags + 6 PCR bytes
+        first[5] = 0b0001_0000; // PCR flag
+        first[12] = 0; // pointer_field
+        first[13] = 0x42; // table_id
+
+        let mut second = first;
+        second[6..12].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        second[13] = 0x43;
+
+        assert!(!Packet::new(&first).is_duplicate_of(&Packet::new(&second)));
+    }
+
+    #[test]
+    fn null_packet_is_not_duplicate() {
+        let mut buf = [0xffu8; Packet::SIZE];
+        buf[0] = Packet::SYNC_BYTE;
+        buf[1] = 0x1f; // PID high bits for null packet
+        buf[2] = 0xff; // PID low bits for null packet
+        buf[3] = 0b0001_0011; // payload only, CC=3
+
+        assert!(!Packet::new(&buf).is_duplicate_of(&Packet::new(&buf)));
+    }
+
+    #[test]
+    fn packet_without_payload_is_not_duplicate() {
+        let mut buf = [0xffu8; Packet::SIZE];
+        buf[0] = Packet::SYNC_BYTE;
+        buf[1] = 0; // PID high bits = 0
+        buf[2] = 0; // PID low bits = 0
+        buf[3] = 0b0010_0011; // adaptation field only, CC=3
+        buf[4] = 183; // adaptation field fills the packet
+
+        assert!(!Packet::new(&buf).is_duplicate_of(&Packet::new(&buf)));
     }
 
     #[test]

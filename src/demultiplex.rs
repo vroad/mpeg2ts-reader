@@ -58,6 +58,58 @@ impl<Ctx: DemuxContext> PacketFilter for NullPacketFilter<Ctx> {
     }
 }
 
+/// `PacketFilter` wrapper which suppresses duplicate Transport Stream packets.
+///
+/// This filter stores one complete TS packet so it can compare the current packet with the
+/// previous packet using [`Packet::is_duplicate_of()`](../packet/struct.Packet.html#method.is_duplicate_of).
+/// Wrap a filter in this type only when duplicate packet suppression is required; the standard
+/// PSI framers perform continuity-counter gap detection without storing full packets.
+pub struct DuplicatePacketFilter<F: PacketFilter> {
+    inner: F,
+    last_packet: Option<[u8; packet::Packet::SIZE]>,
+}
+impl<F: PacketFilter> DuplicatePacketFilter<F> {
+    /// Wrap the given packet filter with duplicate packet suppression.
+    pub fn new(inner: F) -> DuplicatePacketFilter<F> {
+        DuplicatePacketFilter {
+            inner,
+            last_packet: None,
+        }
+    }
+
+    /// Return the wrapped packet filter.
+    pub fn into_inner(self) -> F {
+        self.inner
+    }
+}
+impl<F: PacketFilter> PacketFilter for DuplicatePacketFilter<F> {
+    type Ctx = F::Ctx;
+
+    fn consume(&mut self, ctx: &mut Self::Ctx, pk: &packet::Packet<'_>) {
+        let last_packet = self
+            .last_packet
+            .as_ref()
+            .map(|last_packet| packet::Packet::new(last_packet));
+
+        if last_packet
+            .as_ref()
+            .is_some_and(|last_packet| last_packet.is_duplicate_of(pk))
+        {
+            // The spec allows a packet to appear at most twice (the original plus one
+            // duplicate). A run of 3+ identical packets therefore contains an illegal
+            // duplicate, but that is currently not treated as an error - every duplicate is
+            // silently dropped.
+            return;
+        }
+
+        let mut last_packet = [0u8; packet::Packet::SIZE];
+        last_packet.copy_from_slice(pk.buffer());
+        self.last_packet = Some(last_packet);
+
+        self.inner.consume(ctx, pk);
+    }
+}
+
 /// Creates the boilerplate needed for a filter-implementation-specific `DemuxContext`.
 ///
 /// This macro takes two arguments; the name for the new type, and the name of an existing
@@ -892,6 +944,68 @@ pub(crate) mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn duplicate_packet_filter_drops_duplicate_packets() {
+        let mut filter = demultiplex::DuplicatePacketFilter::new(CountPacketFilter { count: 0 });
+        let mut ctx = NullDemuxContext::new();
+        let mut buf = [0xffu8; packet::Packet::SIZE];
+        buf[0] = packet::Packet::SYNC_BYTE;
+        buf[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        buf[2] = 0; // PID low bits = 0
+        buf[3] = 0b0001_0011; // payload only, CC=3
+        buf[4] = 0; // pointer_field
+        buf[5] = 0x42; // table_id
+
+        filter.consume(&mut ctx, &Packet::new(&buf));
+        filter.consume(&mut ctx, &Packet::new(&buf));
+
+        assert_eq!(filter.into_inner().count, 1);
+    }
+
+    #[test]
+    fn duplicate_packet_filter_ignores_pcr_differences() {
+        let mut filter = demultiplex::DuplicatePacketFilter::new(CountPacketFilter { count: 0 });
+        let mut ctx = NullDemuxContext::new();
+        let mut first = [0xffu8; packet::Packet::SIZE];
+        first[0] = packet::Packet::SYNC_BYTE;
+        first[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        first[2] = 0; // PID low bits = 0
+        first[3] = 0b0011_0011; // adaptation field + payload, CC=3
+        first[4] = 7; // adaptation_field_length: flags + 6 PCR bytes
+        first[5] = 0b0001_0000; // PCR flag
+        first[12] = 0; // pointer_field
+        first[13] = 0x42; // table_id
+
+        let mut second = first;
+        second[6..12].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+
+        filter.consume(&mut ctx, &Packet::new(&first));
+        filter.consume(&mut ctx, &Packet::new(&second));
+
+        assert_eq!(filter.into_inner().count, 1);
+    }
+
+    #[test]
+    fn duplicate_packet_filter_keeps_same_counter_different_payload() {
+        let mut filter = demultiplex::DuplicatePacketFilter::new(CountPacketFilter { count: 0 });
+        let mut ctx = NullDemuxContext::new();
+        let mut first = [0xffu8; packet::Packet::SIZE];
+        first[0] = packet::Packet::SYNC_BYTE;
+        first[1] = 0b0100_0000; // PUSI=1, PID high bits = 0
+        first[2] = 0; // PID low bits = 0
+        first[3] = 0b0001_0011; // payload only, CC=3
+        first[4] = 0; // pointer_field
+        first[5] = 0x42; // table_id
+
+        let mut second = first;
+        second[5] = 0x43;
+
+        filter.consume(&mut ctx, &Packet::new(&first));
+        filter.consume(&mut ctx, &Packet::new(&second));
+
+        assert_eq!(filter.into_inner().count, 2);
     }
 
     #[test]

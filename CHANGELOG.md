@@ -38,6 +38,8 @@
  - `PesError` variants: `InvalidStartCode`, `InvalidCheckBits`, `HeaderLengthExceedsBuffer`, `HeaderDataLengthMismatch`.
  - Updated `StreamType` constants and `CoreDescriptors` / `AudioType` variants to match the 2025 edition.
  - Added TSDT (Transport Stream Description Table) support: `psi::tsdt::TsdtSection` for parsing, `demultiplex::TsdtConsumer` trait for receiving parsed sections, and `demultiplex::TsdtPacketFilter` for integration with the demuxer.
+ - Added `Packet::is_duplicate_of()` for detecting duplicate TS packets.
+ - Added `demultiplex::DuplicatePacketFilter` for optional duplicate TS packet suppression; callers opt in by explicitly wrapping the packet filter that should suppress duplicates.
 
 ### Removed
  - `log` dependency.
