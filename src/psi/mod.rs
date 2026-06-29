@@ -16,7 +16,8 @@
 //!
 //! # Core types
 //!
-//! * [`SectionPacketConsumer`](struct.SectionPacketConsumer.html) converts *Packets* into *Sections*
+//! * [`SectionSyntaxFramer`] and [`CompactSyntaxFramer`] convert *Packets* into complete
+//!   sections for section-syntax and compact-syntax payloads respectively.
 //!
 //! Note that the specific types of table such as Program Association Table are defined elsewhere
 //! with only the generic functionality in this module.
@@ -388,6 +389,7 @@ pub struct Framer<S: SectionSyntax> {
     parser: S::Parser,
     synced: bool,
     _phantom: PhantomData<S>,
+    last_cc: Option<packet::ContinuityCounter>,
 }
 
 /// Converts a stream of transport stream packets carrying 'section syntax' PSI table sections
@@ -413,6 +415,7 @@ impl<S: SectionSyntax> Framer<S> {
             parser,
             synced: false,
             _phantom: PhantomData,
+            last_cc: None,
         }
     }
 
@@ -420,6 +423,34 @@ impl<S: SectionSyntax> Framer<S> {
     /// method for each complete PSI section found within the packet (possibly together with
     /// data buffered from earlier packets).
     pub fn consume(&mut self, ctx: &mut S::Context, pk: &packet::Packet<'_>) {
+        let discontinuous = if let Some(last_cc) = self.last_cc {
+            let continuous = if pk.adaptation_control().has_payload() {
+                pk.continuity_counter().follows(last_cc)
+            } else {
+                pk.continuity_counter().count() == last_cc.count()
+            };
+            if !continuous {
+                let signaled_discontinuity = pk
+                    .adaptation_field()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|af| af.discontinuity_indicator());
+                if !signaled_discontinuity {
+                    ctx.error(DemuxError::ContinuityCounterGap { pid: self.pid });
+                }
+                self.sync_lost();
+            }
+            !continuous
+        } else {
+            false
+        };
+
+        if discontinuous && !pk.payload_unit_start_indicator() {
+            return;
+        }
+
+        self.last_cc = Some(pk.continuity_counter());
+
         match pk.payload() {
             Ok(Some(pk_buf)) => {
                 if pk.payload_unit_start_indicator() {
@@ -475,14 +506,24 @@ impl<S: SectionSyntax> Framer<S> {
         }
     }
 
-    /// Discard any in-progress section data, e.g. after a continuity counter discontinuity.
+    /// Discard any in-progress section data while preserving the stream sync status.
     pub fn reset(&mut self) {
         // NB self.synced is intentionally preserved - reset() only discards in-flight
         // section bytes; the framer's view of "we have observed at least one PUSI=1 packet
-        // on this PID" stays valid across resets.
+        // on this PID" stays valid across resets. The continuity-counter baseline is also
+        // preserved: discarding malformed section bytes does not invalidate the packet's
+        // (valid) continuity_counter as a baseline for the next packet's gap check.
         self.buf.clear();
         self.state = FramerState::Idle;
         S::reset_parser(&mut self.parser);
+    }
+
+    fn sync_lost(&mut self) {
+        self.reset();
+        self.synced = false;
+        // Clear the continuity-counter baseline on true sync loss so re-acquisition does not
+        // trigger a spurious discontinuity error.
+        self.last_cc = None;
     }
 
     /// Core state machine: consume a contiguous slice of PSI bytes.
@@ -700,6 +741,30 @@ mod test {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingContext {
+        errors: Vec<DemuxError>,
+    }
+
+    impl ErrorSink for RecordingContext {
+        fn error(&mut self, error: DemuxError) {
+            self.errors.push(error);
+        }
+    }
+
+    struct RecordingNullSyntaxSink;
+    impl WholeSectionSyntaxPayloadParser for RecordingNullSyntaxSink {
+        type Context = RecordingContext;
+        fn section<'a>(
+            &mut self,
+            _ctx: &mut Self::Context,
+            _header: &SectionCommonHeader,
+            _table_syntax_header: &TableSyntaxHeader<'a>,
+            _data: &'a [u8],
+        ) {
+        }
+    }
+
     #[test]
     fn continuation_outside_section() {
         // A non-PUSI packet arriving when the framer is idle: no section data is in progress,
@@ -759,6 +824,22 @@ mod test {
         let mut buf = [0xffu8; 188];
         write_ts_header(&mut buf, pusi, pid, cc, false);
         buf[4..4 + prefix.len()].copy_from_slice(prefix);
+        buf
+    }
+
+    fn build_packet_with_adaptation_flags(
+        pusi: bool,
+        pid: u16,
+        cc: u8,
+        adaptation_flags: u8,
+        prefix: &[u8],
+    ) -> [u8; 188] {
+        assert!(prefix.len() <= 182);
+        let mut buf = [0xffu8; 188];
+        write_ts_header(&mut buf, pusi, pid, cc, true);
+        buf[4] = 1; // adaptation_field_length: flags byte only
+        buf[5] = adaptation_flags;
+        buf[6..6 + prefix.len()].copy_from_slice(prefix);
         buf
     }
 
@@ -872,6 +953,19 @@ mod test {
     }
 
     #[allow(clippy::type_complexity)]
+    fn recording_syntax_framer() -> (
+        SectionSyntaxFramer<RecordingSectionSink<RecordingContext>>,
+        Rc<RefCell<Vec<Vec<u8>>>>,
+    ) {
+        let sink_out = Rc::new(RefCell::new(vec![]));
+        let framer = SectionSyntaxFramer::new(
+            packet::Pid::new(0),
+            RecordingSectionSink::new(sink_out.clone()),
+        );
+        (framer, sink_out)
+    }
+
+    #[allow(clippy::type_complexity)]
     fn compact_framer() -> (
         CompactSyntaxFramer<RecordingSectionSink<()>>,
         Rc<RefCell<Vec<Vec<u8>>>>,
@@ -901,6 +995,255 @@ mod test {
         framer.consume(&mut (), &Packet::new(&pkt2));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
+    }
+
+    #[test]
+    fn framer_reports_continuity_counter_gap_without_adaptation_field() {
+        let mut framer = SectionSyntaxFramer::new(packet::Pid::new(0), RecordingNullSyntaxSink);
+        let mut ctx = RecordingContext::default();
+        let section = make_syntax_section(0x42, 300);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&section[..183]);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
+        let pkt2 = build_packet(false, 0, 2, &section[183..]);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        assert!(ctx.errors.is_empty());
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn framer_reports_continuity_counter_gap_after_malformed_packet() {
+        let mut framer = SectionSyntaxFramer::new(packet::Pid::new(0), RecordingNullSyntaxSink);
+        let mut ctx = RecordingContext::default();
+
+        // A PUSI=1 packet whose pointer_field (200) points past the end of the payload.
+        // Its continuity_counter (0) is perfectly valid; only the *payload* is malformed,
+        // so this packet is a legitimate continuity baseline for the next packet.
+        let pkt1 = build_packet(true, 0, 0, &[200]);
+        // Next packet skips a count (expected 1, got 3) with no discontinuity_indicator,
+        // so a ContinuityCounterGap should be reported relative to pkt1's cc of 0.
+        let pkt2 = build_packet(false, 0, 3, &[]);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::PsiPointerOutOfBounds {
+                pid: packet::Pid::new(0)
+            }]
+        );
+        ctx.errors.clear();
+
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn framer_reports_continuity_counter_gap_without_discontinuity_indicator() {
+        let mut framer = SectionSyntaxFramer::new(packet::Pid::new(0), RecordingNullSyntaxSink);
+        let mut ctx = RecordingContext::default();
+        let section = make_syntax_section(0x42, 300);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&section[..183]);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
+        let pkt2 = build_packet_with_adaptation_flags(false, 0, 2, 0, &section[183..]);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        assert!(ctx.errors.is_empty());
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn framer_recovers_from_cc_gap_on_pusi_packet() {
+        let (mut framer, sink) = recording_syntax_framer();
+        let mut ctx = RecordingContext::default();
+
+        let interrupted = make_syntax_section(0x42, 300);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&interrupted[..183]);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
+
+        let recovered = make_syntax_section(0x43, 16);
+        let mut recovered_payload = vec![0u8];
+        recovered_payload.extend_from_slice(&recovered);
+        let pkt2 = build_packet(true, 0, 5, &recovered_payload);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        assert!(ctx.errors.is_empty());
+        assert!(sink.borrow().is_empty());
+
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+        assert_eq!(sink.borrow().len(), 1);
+        assert_eq!(&sink.borrow()[0], &recovered);
+    }
+
+    #[test]
+    fn framer_discards_non_pusi_packets_until_resync_after_continuity_gap() {
+        let (mut framer, sink) = recording_syntax_framer();
+        let mut ctx = RecordingContext::default();
+
+        let interrupted = make_syntax_section(0x42, 300);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&interrupted[..183]);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
+        let pkt2 = build_packet(false, 0, 5, &interrupted[183..]);
+        let pkt3 = build_packet(false, 0, 10, &[0x12; 20]);
+
+        let recovered = make_syntax_section(0x43, 16);
+        let mut recovered_payload = vec![0u8];
+        recovered_payload.extend_from_slice(&recovered);
+        let pkt4 = build_packet(true, 0, 11, &recovered_payload);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+        framer.consume(&mut ctx, &Packet::new(&pkt3));
+        framer.consume(&mut ctx, &Packet::new(&pkt4));
+
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+        assert_eq!(sink.borrow().len(), 1);
+        assert_eq!(&sink.borrow()[0], &recovered);
+    }
+
+    #[test]
+    fn framer_suppresses_cc_error_when_discontinuity_indicator_is_set() {
+        let mut framer = SectionSyntaxFramer::new(packet::Pid::new(0), RecordingNullSyntaxSink);
+        let mut ctx = RecordingContext::default();
+        let section = make_syntax_section(0x42, 300);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&section[..183]);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
+        let pkt2 = build_packet_with_adaptation_flags(
+            false,
+            0,
+            2,
+            0b1000_0000, // discontinuity_indicator
+            &section[183..],
+        );
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        assert!(ctx.errors.is_empty());
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+
+        assert!(ctx.errors.is_empty());
+    }
+
+    #[test]
+    fn framer_respects_discontinuity_indicator_on_cc_gap() {
+        let (mut framer, sink) = recording_syntax_framer();
+        let mut ctx = RecordingContext::default();
+        let interrupted = make_syntax_section(0x42, 300);
+        let mut first = vec![0u8];
+        first.extend_from_slice(&interrupted[..183]);
+        let pkt1 = build_full_packet(true, 0, 0, &first);
+        let pkt2 = build_packet_with_adaptation_flags(
+            false,
+            0,
+            2,
+            0b1000_0000, // discontinuity_indicator
+            &interrupted[183..],
+        );
+        let recovered = make_syntax_section(0x43, 16);
+        let mut recovered_payload = vec![0u8];
+        recovered_payload.extend_from_slice(&recovered);
+        let pkt3 = build_packet(true, 0, 0, &recovered_payload);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt1));
+        assert!(ctx.errors.is_empty());
+        assert!(sink.borrow().is_empty());
+
+        framer.consume(&mut ctx, &Packet::new(&pkt2));
+        assert!(ctx.errors.is_empty());
+        assert!(sink.borrow().is_empty());
+
+        framer.consume(&mut ctx, &Packet::new(&pkt3));
+        assert!(ctx.errors.is_empty());
+        assert_eq!(sink.borrow().len(), 1);
+        assert_eq!(&sink.borrow()[0], &recovered);
+    }
+
+    #[test]
+    fn framer_does_not_suppress_duplicate_packet_by_default() {
+        let (mut framer, sink) = recording_syntax_framer();
+        let mut ctx = RecordingContext::default();
+        let section = make_syntax_section(0x42, 16);
+        let mut payload = vec![0u8];
+        payload.extend_from_slice(&section);
+        let pkt = build_packet(true, 0, 0, &payload);
+
+        framer.consume(&mut ctx, &Packet::new(&pkt));
+        framer.consume(&mut ctx, &Packet::new(&pkt));
+
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+        assert_eq!(sink.borrow().len(), 2);
+        assert_eq!(&sink.borrow()[0], &section);
+        assert_eq!(&sink.borrow()[1], &section);
+    }
+
+    #[test]
+    fn framer_recovers_from_same_counter_pusi_packet() {
+        let (mut framer, sink) = recording_syntax_framer();
+        let mut ctx = RecordingContext::default();
+        let first_section = make_syntax_section(0x42, 16);
+        let second_section = make_syntax_section(0x43, 16);
+        let mut first_payload = vec![0u8];
+        first_payload.extend_from_slice(&first_section);
+        let mut second_payload = vec![0u8];
+        second_payload.extend_from_slice(&second_section);
+
+        framer.consume(
+            &mut ctx,
+            &Packet::new(&build_packet(true, 0, 0, &first_payload)),
+        );
+        framer.consume(
+            &mut ctx,
+            &Packet::new(&build_packet(true, 0, 0, &second_payload)),
+        );
+
+        assert_eq!(
+            ctx.errors,
+            vec![DemuxError::ContinuityCounterGap {
+                pid: packet::Pid::new(0)
+            }]
+        );
+        assert_eq!(sink.borrow().len(), 2);
+        assert_eq!(&sink.borrow()[0], &first_section);
+        assert_eq!(&sink.borrow()[1], &second_section);
     }
 
     #[test]
@@ -1084,7 +1427,7 @@ mod test {
         let section = make_syntax_section(0x42, 16);
         let mut full = vec![0u8];
         full.extend_from_slice(&section);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &full)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 1, &full)));
         assert_eq!(sink.borrow().len(), 1);
         assert_eq!(&sink.borrow()[0], &section);
     }
@@ -1230,7 +1573,7 @@ mod test {
         let section_b = make_compact_section(0x71, 4);
         let mut payload2 = vec![3u8, 0x7e, 0x00, 0x00];
         payload2.extend_from_slice(&section_b);
-        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 0, &payload2)));
+        framer.consume(&mut (), &Packet::new(&build_packet(true, 0, 1, &payload2)));
 
         // Only the two real sections must be delivered - no bogus 0x7e section.
         assert_eq!(sink.borrow().len(), 2);

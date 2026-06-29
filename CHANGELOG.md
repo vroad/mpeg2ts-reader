@@ -40,6 +40,7 @@
  - Added TSDT (Transport Stream Description Table) support: `psi::tsdt::TsdtSection` for parsing, `demultiplex::TsdtConsumer` trait for receiving parsed sections, and `demultiplex::TsdtPacketFilter` for integration with the demuxer.
  - Added `Packet::is_duplicate_of()` for detecting duplicate TS packets.
  - Added `demultiplex::DuplicatePacketFilter` for optional duplicate TS packet suppression; callers opt in by explicitly wrapping the packet filter that should suppress duplicates.
+ - `SectionSyntaxFramer` and `CompactSyntaxFramer` now detect continuity counter gaps. On a gap, they discard any in-progress section and report `DemuxError::ContinuityCounterGap` to the `ErrorSink`.
 
 ### Removed
  - `log` dependency.

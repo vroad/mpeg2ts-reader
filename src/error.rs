@@ -150,6 +150,12 @@ pub enum DemuxError {
         /// The parsing error.
         error: PacketError,
     },
+    /// A PSI packet's continuity counter did not match the expected value; in-progress
+    /// section data was discarded.
+    ContinuityCounterGap {
+        /// The PID of the PSI packet.
+        pid: packet::Pid,
+    },
 }
 impl fmt::Display for DemuxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -248,6 +254,11 @@ impl fmt::Display for DemuxError {
             DemuxError::MalformedPayload { pid, error } => {
                 write!(f, "{:?}: malformed payload: {}", pid, error)
             }
+            DemuxError::ContinuityCounterGap { pid } => write!(
+                f,
+                "{:?}: continuity counter gap; in-progress section discarded",
+                pid
+            ),
         }
     }
 }
@@ -342,6 +353,7 @@ mod test {
                 pid,
                 error: PacketError::PayloadOutOfBounds { offset: 200 },
             },
+            DemuxError::ContinuityCounterGap { pid },
         ];
         for error in &cases {
             // exercise Display impl; just verify it doesn't panic and produces non-empty output
